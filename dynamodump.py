@@ -567,7 +567,7 @@ def do_empty(dynamo, table_name):
         datetime.datetime.now().replace(microsecond=0) - start_time))
 
 
-def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None, read_capacity_ratio=READ_CAPACITY_RATIO):
+def do_backup(dynamo, read_capacity, read_capacity_ratio, tableQueue=None, srcTable=None):
     """
     Connect to DynamoDB and perform the backup for srcTable or each table in tableQueue
     """
@@ -604,13 +604,15 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None, read_capaci
                 if read_capacity is None:
                     read_capacity = original_read_capacity
 
+                if (read_capacity_ratio is None):
+                    read_capacity_ratio = READ_CAPACITY_RATIO
+
                 # override table read capacity if specified
                 if read_capacity != original_read_capacity:
                     update_provisioned_throughput(dynamo, table_name,
                                                   read_capacity, original_write_capacity)
 
                 # calculate backup read capacity
-                print(read_capacity_ratio)
                 backup_read_capacity = read_capacity * float(read_capacity_ratio)
 
                 # calculate limit
@@ -977,8 +979,7 @@ def main():
 
         try:
             if args.srcTable.find("*") == -1:
-                do_backup(conn, args.read_capacity, tableQueue=None,
-                          read_capacity_ratio=args.readCapacityRatio)
+                do_backup(conn, args.read_capacity, args.readCapacityRatio, tableQueue=None)
         except AttributeError:
             # Didn't specify srcTable if we get here
 
@@ -986,9 +987,9 @@ def main():
             threads = []
 
             for i in range(MAX_NUMBER_BACKUP_WORKERS):
-                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity),
-                                     kwargs={"tableQueue": q,
-                                             "read_capacity_ratio": args.readCapacityRatio})
+                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity,
+                                                             args.readCapacityRatio),
+                                     kwargs={"tableQueue": q})
                 t.start()
                 threads.append(t)
                 time.sleep(THREAD_START_DELAY)
