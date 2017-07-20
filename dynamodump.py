@@ -43,6 +43,7 @@ LOCAL_REGION = "local"
 LOG_LEVEL = "INFO"
 DATA_DUMP = "dump"
 RESTORE_WRITE_CAPACITY = 25
+READ_CAPACITY_RATIO = 1
 THREAD_START_DELAY = 1  # seconds
 CURRENT_WORKING_DIR = os.getcwd()
 DEFAULT_PREFIX_SEPARATOR = "-"
@@ -262,6 +263,24 @@ def do_archive(archive_type, dump_path):
         return False, None
 
 
+class RateLimiter:
+
+    def __init__(self, permits_per_second):
+        self.permits_per_second = permits_per_second
+        self.consumed_permits = 0
+        self.start_time_seconds = time.time()
+
+    def acquire(self, permits=1):
+        self.consumed_permits += permits
+
+        duration_seconds = time.time() - self.start_time_seconds
+        expected_consumed_permits = self.permits_per_second * duration_seconds
+        sleep_duration_seconds = (self.consumed_permits - expected_consumed_permits) / self.permits_per_second
+
+        if sleep_duration_seconds > 0:
+            time.sleep(sleep_duration_seconds)
+
+
 def get_table_name_matches(conn, table_name_wildcard, separator):
     """
     Find tables to backup
@@ -467,11 +486,33 @@ def update_provisioned_throughput(conn, table_name, read_capacity, write_capacit
         wait_for_active_table(conn, table_name, "updated")
 
 
+def calculate_limit(table_desc, read_capacity):
+    table_size_bytes = table_desc["Table"]["TableSizeBytes"]
+    item_count = table_desc["Table"]["ItemCount"]
+    if item_count != 0:
+        average_item_size_bytes = table_size_bytes / item_count
+    else:
+        # chose default item size in case the table is empty
+        average_item_size_bytes = 128
+
+    unit_size_bytes = 4096
+    eventual_consistency_factor = 2
+    items_per_second_for_read_unit = float(unit_size_bytes * eventual_consistency_factor) / average_item_size_bytes
+    items_per_second = items_per_second_for_read_unit * read_capacity
+    limit = int(items_per_second)
+
+    # if limit generates pages greater than 1MB, then it will be ignored anyway
+    max_page_size_bytes = 1024 * 1024
+    if limit * average_item_size_bytes > max_page_size_bytes:
+        limit = None
+
+    return limit
+
+
 def do_empty(dynamo, table_name):
     """
     Empty table named table_name
     """
-
     logging.info("Starting Empty for " + table_name + "..")
 
     # get table schema
@@ -520,7 +561,7 @@ def do_empty(dynamo, table_name):
         datetime.datetime.now().replace(microsecond=0) - start_time))
 
 
-def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
+def do_backup(dynamo, read_capacity, read_capacity_ratio, tableQueue=None, srcTable=None):
     """
     Connect to DynamoDB and perform the backup for srcTable or each table in tableQueue
     """
@@ -554,22 +595,39 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                 original_write_capacity = \
                     table_desc["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
 
+                if read_capacity is None:
+                    read_capacity = original_read_capacity
+
+                if (read_capacity_ratio is None):
+                    read_capacity_ratio = READ_CAPACITY_RATIO
+
                 # override table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
+                if read_capacity != original_read_capacity:
                     update_provisioned_throughput(dynamo, table_name,
                                                   read_capacity, original_write_capacity)
 
+                # calculate backup read capacity
+                backup_read_capacity = read_capacity * float(read_capacity_ratio)
+
+                # calculate limit
+                limit = calculate_limit(table_desc, backup_read_capacity)
+                logging.debug("Limit: %s" % limit)
+
                 # get table data
-                logging.info("Dumping table items for " + table_name)
+                logging.info("Dumping table items for %s, read capacity: %.1f, will use %.1f for backup" % (table_name, read_capacity, backup_read_capacity))
                 mkdir_p(args.dumpPath + os.sep + table_name + os.sep + DATA_DIR)
 
                 i = 1
                 last_evaluated_key = None
 
+                rate_limiter = RateLimiter(backup_read_capacity)
+
                 while True:
                     try:
                         scanned_table = dynamo.scan(table_name,
-                                                    exclusive_start_key=last_evaluated_key)
+                                                    exclusive_start_key=last_evaluated_key,
+                                                    limit=limit,
+                                                    return_consumed_capacity="TOTAL")
                     except ProvisionedThroughputExceededException:
                         logging.error("EXCEEDED THROUGHPUT ON TABLE " +
                                       table_name + ".  BACKUP FOR IT IS USELESS.")
@@ -584,13 +642,17 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
 
                     i += 1
 
+                    consumed_capacity = scanned_table["ConsumedCapacity"]["CapacityUnits"]
+                    logging.debug("Consumed capacity: %s" % consumed_capacity)
+                    rate_limiter.acquire(consumed_capacity)
+
                     try:
                         last_evaluated_key = scanned_table["LastEvaluatedKey"]
                     except KeyError:
                         break
 
                 # revert back to original table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
+                if read_capacity != original_read_capacity:
                     update_provisioned_throughput(dynamo,
                                                   table_name,
                                                   original_read_capacity,
@@ -598,7 +660,8 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                                                   False)
 
                 logging.info("Backup for " + table_name + " table completed. Time taken: " + str(
-                    datetime.datetime.now().replace(microsecond=0) - start_time))
+                    datetime.datetime.now().replace(microsecond=0) - start_time) +
+                    ", Consumed: %s read units" % rate_limiter.consumed_permits)
 
             tableQueue.task_done()
 
@@ -829,6 +892,9 @@ def main():
     parser.add_argument("--writeCapacity",
                         help="Change the temp write capacity of the DynamoDB table to restore "
                         "to [defaults to " + str(RESTORE_WRITE_CAPACITY) + ", optional]")
+    parser.add_argument("--readCapacityRatio",
+                        help="Use given ratio of table read capacity [defaults to " +
+                        str(READ_CAPACITY_RATIO) + ", optional]")
     parser.add_argument("--schemaOnly", action="store_true", default=False,
                         help="Backup or restore the schema only. Do not backup/restore data. "
                         "Can be used with both backup and restore modes. Cannot be used with "
@@ -907,9 +973,9 @@ def main():
 
         try:
             if args.srcTable.find("*") == -1:
-                do_backup(conn, args.read_capacity, tableQueue=None)
+                do_backup(conn, args.read_capacity, args.readCapacityRatio, tableQueue=None)
             else:
-                do_backup(conn, args.read_capacity, matching_backup_tables)
+                do_backup(conn, args.read_capacity, args.readCapacityRatio, matching_backup_tables)
         except AttributeError:
             # Didn't specify srcTable if we get here
 
@@ -917,7 +983,8 @@ def main():
             threads = []
 
             for i in range(MAX_NUMBER_BACKUP_WORKERS):
-                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity),
+                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity,
+                                                             args.readCapacityRatio),
                                      kwargs={"tableQueue": q})
                 t.start()
                 threads.append(t)
